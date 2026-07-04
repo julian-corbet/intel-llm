@@ -1,0 +1,69 @@
+name: Update AUR packages
+
+# Daily: bump the two upstream-tracking packages (llama.cpp-sycl-bin,
+# openvino-genai-bin) to the latest release and push any change to its AUR repo.
+# The intel-llm / intel-llm-convert packages are versioned by hand.
+on:
+  schedule:
+    - cron: '23 5 * * *'   # daily 05:23 UTC
+  workflow_dispatch: {}
+
+concurrency: { group: update-aur, cancel-in-progress: false }
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Tooling
+        run: pacman -Sy --noconfirm --needed git jq pacman-contrib openssh python
+
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Build user (makepkg refuses root)
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: SSH for AUR
+        env: { AUR_SSH_KEY: '${{ secrets.AUR_SSH_KEY }}' }
+        run: |
+          install -dm700 /home/builder/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > /home/builder/.ssh/aur
+          chmod 600 /home/builder/.ssh/aur
+          ssh-keyscan -H aur.archlinux.org >> /home/builder/.ssh/known_hosts 2>/dev/null
+          cat > /home/builder/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+          EOF
+          chown -R builder:builder /home/builder/.ssh
+
+      - name: Bump + publish each tracking package
+        env: { GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        run: |
+          sudo -u builder bash -eo pipefail -c '
+            git config --global user.name  aur-bot
+            git config --global user.email admin+aur@sys.corbet.ch
+            for entry in "llama.cpp-sycl-bin:scripts/bump-llama-sycl.sh:llama-sycl" \
+                         "openvino-genai-bin:scripts/bump-openvino-genai.sh:"; do
+              pkg="${entry%%:*}"; rest="${entry#*:}"; script="${rest%%:*}"; extra="${rest#*:}"
+              env GITHUB_TOKEN="'"$GITHUB_TOKEN"'" bash "$script"
+              cd "packages/$pkg"
+              if git diff --quiet -- PKGBUILD .SRCINFO; then echo "$pkg: unchanged"; cd - >/dev/null; continue; fi
+              ver="$(sed -nE "s/^pkgver=(.*)$/\1/p" PKGBUILD)"
+              git add PKGBUILD .SRCINFO; git commit -m "$pkg: update to $ver"
+              rm -rf /tmp/aur-$pkg
+              git clone "ssh://aur@aur.archlinux.org/$pkg.git" /tmp/aur-$pkg
+              cp PKGBUILD .SRCINFO /tmp/aur-$pkg/
+              [ -n "$extra" ] && cp $extra /tmp/aur-$pkg/ || true
+              ( cd /tmp/aur-$pkg && git add -A && git commit -m "update to $ver" && git push )
+              cd - >/dev/null
+            done
+          '
+
+      - name: Push repo commits
+        run: git push || true
