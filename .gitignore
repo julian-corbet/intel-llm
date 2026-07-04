@@ -1,0 +1,9 @@
+# Build artifacts — sources are downloaded at build time, never committed.
+*.tar.gz
+*.tar.zst
+*.whl
+*.pkg.tar.*
+**/src/
+**/pkg/
+**/sycl/
+**/openvino/
