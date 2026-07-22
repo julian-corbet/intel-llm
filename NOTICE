@@ -1,0 +1,12 @@
+NOTICE
+
+This repository's own content (packaging, scripts, documentation) is licensed
+under the MIT License (see LICENSE).
+
+It packages and distributes prebuilt binaries of third-party projects, which
+retain their own upstream licenses:
+
+- llama.cpp (packages/llama.cpp-sycl-bin) — MIT License
+  https://github.com/ggml-org/llama.cpp
+- OpenVINO GenAI (packages/openvino-genai-bin) — Apache License 2.0
+  https://github.com/openvinotoolkit/openvino.genai
