@@ -1,8 +1,12 @@
 name: Update AUR packages
 
-# Daily: bump the two upstream-tracking packages (llama.cpp-sycl-bin,
+# Daily: bump the upstream-tracking packages (llama.cpp-sycl-bin,
 # openvino-genai-bin) to the latest release and push any change to its AUR repo.
 # The intel-llm / intel-llm-convert packages are versioned by hand.
+#
+# Every tracking package is its own matrix leg with fail-fast disabled, so a
+# package that no-ops, or whose upstream is broken, reports its own result and
+# cannot freeze the bump for any other package.
 on:
   schedule:
     - cron: '23 5 * * *'   # daily 05:23 UTC
@@ -10,10 +14,32 @@ on:
 
 concurrency: { group: update-aur, cancel-in-progress: false }
 
+permissions:
+  contents: read
+
 jobs:
   bump:
+    name: bump ${{ matrix.pkg }}
     runs-on: ubuntu-latest
     container: archlinux:base-devel
+    timeout-minutes: 15
+    # The bot commits the new pkgver back to main; the default repository token
+    # is read-only, so the write scope has to be requested explicitly here.
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # Serial: every leg pushes to main, so overlapping legs would race on the
+      # same branch. Isolation comes from fail-fast, not from parallelism.
+      max-parallel: 1
+      matrix:
+        include:
+          - pkg: llama.cpp-sycl-bin
+            script: scripts/bump-llama-sycl.sh
+            extra: llama-sycl
+          - pkg: openvino-genai-bin
+            script: scripts/bump-openvino-genai.sh
+            extra: ''
     steps:
       - name: Tooling
         run: pacman -Sy --noconfirm --needed git jq pacman-contrib openssh python
@@ -42,28 +68,85 @@ jobs:
           EOF
           chown -R builder:builder /home/builder/.ssh
 
-      - name: Bump + publish each tracking package
-        env: { GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+      - name: Bump and publish ${{ matrix.pkg }}
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          PKG: '${{ matrix.pkg }}'
+          SCRIPT: '${{ matrix.script }}'
+          EXTRA: '${{ matrix.extra }}'
         run: |
-          sudo -u builder bash -eo pipefail -c '
-            git config --global user.name  aur-bot
-            git config --global user.email admin+aur@sys.corbet.ch
-            for entry in "llama.cpp-sycl-bin:scripts/bump-llama-sycl.sh:llama-sycl" \
-                         "openvino-genai-bin:scripts/bump-openvino-genai.sh:"; do
-              pkg="${entry%%:*}"; rest="${entry#*:}"; script="${rest%%:*}"; extra="${rest#*:}"
-              env GITHUB_TOKEN="'"$GITHUB_TOKEN"'" bash "$script"
-              cd "packages/$pkg"
-              if git diff --quiet -- PKGBUILD .SRCINFO; then echo "$pkg: unchanged"; cd - >/dev/null; continue; fi
-              ver="$(sed -nE "s/^pkgver=(.*)$/\1/p" PKGBUILD)"
-              git add PKGBUILD .SRCINFO; git commit -m "$pkg: update to $ver"
-              rm -rf /tmp/aur-$pkg
-              git clone "ssh://aur@aur.archlinux.org/$pkg.git" /tmp/aur-$pkg
-              cp PKGBUILD .SRCINFO /tmp/aur-$pkg/
-              [ -n "$extra" ] && cp $extra /tmp/aur-$pkg/ || true
-              ( cd /tmp/aur-$pkg && git add -A && git commit -m "update to $ver" && git push )
-              cd - >/dev/null
-            done
-          '
+          set -euo pipefail
+          cat > /tmp/bump-one.sh <<'BUMP_EOF'
+          #!/usr/bin/env bash
+          # Publish exactly one tracking package. Reads PKG / SCRIPT / EXTRA from
+          # the environment. Every write is idempotent: the repo commit and the
+          # AUR commit are both skipped when the tree already carries the version,
+          # so a rerun over an already-published version is a clean no-op instead
+          # of an "nothing to commit" exit 1.
+          set -euo pipefail
 
-      - name: Push repo commits
-        run: git push || true
+          git config --global user.name  aur-bot
+          git config --global user.email admin+aur@sys.corbet.ch
+
+          bash "$SCRIPT"
+
+          cd "packages/$PKG"
+          if git diff --quiet -- PKGBUILD .SRCINFO; then
+            echo "$PKG: unchanged"
+            exit 0
+          fi
+          ver="$(sed -nE 's/^pkgver=(.*)$/\1/p' PKGBUILD)"
+          echo "$PKG: publishing $ver"
+
+          # 1. Record the bump in this repository.
+          git add -A -- PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "$PKG: repo already at $ver"
+          else
+            git commit -m "$PKG: update to $ver"
+          fi
+
+          # 2. Mirror it into the AUR repository. The AUR side can already carry
+          #    $ver from an earlier run whose repo push did not land.
+          rm -rf "/tmp/aur-$PKG"
+          git clone "ssh://aur@aur.archlinux.org/$PKG.git" "/tmp/aur-$PKG"
+          cp PKGBUILD .SRCINFO "/tmp/aur-$PKG/"
+          if [ -n "$EXTRA" ]; then cp $EXTRA "/tmp/aur-$PKG/"; fi
+          cd "/tmp/aur-$PKG"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "$PKG: AUR already at $ver"
+          else
+            git commit -m "update to $ver"
+            git push
+          fi
+          BUMP_EOF
+          chmod 0755 /tmp/bump-one.sh
+          sudo -u builder \
+            env GITHUB_TOKEN="$GITHUB_TOKEN" PKG="$PKG" SCRIPT="$SCRIPT" EXTRA="$EXTRA" \
+            bash /tmp/bump-one.sh
+
+      - name: Push repo commit for ${{ matrix.pkg }}
+        run: |
+          set -euo pipefail
+          sudo -u builder bash -euo pipefail -c '
+            git fetch origin main
+            if [ -z "$(git log --oneline origin/main..HEAD)" ]; then
+              echo "nothing to push"
+              exit 0
+            fi
+            # A failed push must be loud: a silenced 403 here froze main for a
+            # month, which in turn made every later run recompute the same diff.
+            for attempt in 1 2 3; do
+              git fetch origin main
+              git rebase origin/main
+              if git push origin HEAD:main; then
+                echo "pushed to main"
+                exit 0
+              fi
+              echo "push attempt $attempt failed, retrying" >&2
+              sleep 5
+            done
+            echo "push to main failed after 3 attempts" >&2
+            exit 1
+          '
