@@ -10,7 +10,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="One entry point for fast local LLMs on Intel laptops (Arc GPU via SYCL + NPU via OpenVINO GenAI)"
 arch=('any')
-url='https://github.com/julian-corbet/intel-llm'
+url='https://github.com/corbet-labs/intel-llm'
 license=('MIT')
 depends=(
   'llama.cpp-sycl-bin'
